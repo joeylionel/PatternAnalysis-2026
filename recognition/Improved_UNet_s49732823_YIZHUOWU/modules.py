@@ -336,6 +336,76 @@ class ImprovedUNet2D(nn.Module):
         logits = ds2_up + ds1
         return logits
 
+# ============================================================================
+# Part 3: Loss Functions & Metrics (Pure PyTorch, Zero NumPy)
+# ============================================================================
+
+class MultiClassDiceLoss(nn.Module):
+    """
+    Soft Sørensen-Dice loss for multi-class segmentation with class-specific weights.
+    Helps prevent gradient collapse when the prostate volume is <2% of the slice.
+    """
+    def __init__(self, smooth: float = 1e-5, weights: torch.Tensor = None):
+        super().__init__()
+        self.smooth = smooth
+        self.weights = weights
+
+    def forward(self, logits: torch.Tensor, targets_onehot: torch.Tensor) -> torch.Tensor:
+        probs = F.softmax(logits, dim=1)
+        dims = (0, 2, 3)
+        intersection = torch.sum(probs * targets_onehot, dim=dims)
+        cardinality = torch.sum(probs + targets_onehot, dim=dims)
+
+        dice_score = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
+        dice_loss = 1.0 - dice_score
+
+        if self.weights is not None:
+            w = self.weights.to(logits.device)
+            return torch.sum(dice_loss * w) / torch.sum(w)
+        return torch.mean(dice_loss)
+
+
+class CombinedLoss(nn.Module):
+    """
+    Weighted combination of Cross-Entropy Loss and Multi-Class Dice Loss.
+    Combines smooth cross-entropy gradients with Dice direct overlap optimization.
+    """
+    def __init__(
+        self,
+        ce_weight: float = 0.5,
+        dice_weight: float = 0.5,
+        class_weights: torch.Tensor = None
+    ):
+        super().__init__()
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.class_weights = class_weights
+        self.dice_loss = MultiClassDiceLoss(weights=class_weights)
+
+    def forward(self, logits: torch.Tensor, targets_onehot: torch.Tensor) -> torch.Tensor:
+        target_labels = torch.argmax(targets_onehot, dim=1)
+        weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
+        ce = F.cross_entropy(logits, target_labels, weight=weight)
+        dice = self.dice_loss(logits, targets_onehot)
+        return self.ce_weight * ce + self.dice_weight * dice
+
+
+def compute_dice_iou(
+    preds_onehot: torch.Tensor,
+    targets_onehot: torch.Tensor,
+    eps: float = 1e-5
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes per-class Sørensen-Dice (DSC) and Intersection-over-Union (IoU).
+    """
+    dims = (0, 2, 3)
+    intersection = torch.sum(preds_onehot * targets_onehot, dim=dims).float()
+    cardinality = torch.sum(preds_onehot + targets_onehot, dim=dims).float()
+    union = cardinality - intersection
+
+    dices = (2.0 * intersection + eps) / (cardinality + eps)
+    ious = (intersection + eps) / (union + eps)
+    return dices, ious
 
 if __name__ == "__main__":
     # Pure PyTorch smoke test for tensor shapes and parameter counts
