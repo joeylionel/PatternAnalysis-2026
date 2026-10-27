@@ -108,6 +108,7 @@ def plot_4panel_autopsy(
     # Panel 4: Discrepancy Overlay Map (Targeting Prostate Class 5)
     # Background in subdued greyscale; errors highlighted in high-contrast colours
     error_canvas = np.zeros((image_np.shape[0], image_np.shape[1], 3), dtype=np.float32)
+ 
     data_range = float(image_np.max() - image_np.min())
     norm_bg = np.clip((image_np - image_np.min()) / (data_range + 1e-8), 0.1, 0.45)
 
