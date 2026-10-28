@@ -1,44 +1,47 @@
-# 3D Improved U-Net for Prostate Segmentation (HipMRI)
+# 2D Improved U-Net for Multi-Organ Pelvic and Prostate MRI Segmentation
 
 **Student Name:** Yizhuo Wu  
 **Student ID:** 49732823  
 **Course:** COMP3710 - Pattern Recognition (2026)  
 **Track:** 2.2 Segmentation — Anatomical Contouring and Radiotherapy Planning  
-**Target Model:** 3D Improved U-Net  (Hard Difficulty)
-**Baseline Model:** 2D U-Net
+**Target Model:** 2D Improved U-Net (Normal Difficulty)  
+**Baseline Model:** Standard 2D U-Net  
 **Execution Environment:** UQ Rangpur HPC Cluster (NVIDIA A100 GPU)
 
 ---
 
 ## 1. Project Description & Working Principles
-This project automates multi-organ pelvic segmentation and prostate clinical target volume (CTV) contouring from MRI scans (`HipMRI` dataset) for external-beam radiotherapy planning. Accurate contouring prevents tumor recurrence (under-contouring) and protects adjacent Organs at Risk (OARs: bladder and rectum) from radiation toxicity.
 
-We implement the **2D Improved U-Net** (Isensee et al., 2018) and benchmark it against a standard **2D U-Net** baseline under a strict patient-level split. Key architectural enhancements include:
-- **Residual Context Modules:** Two 3x3 convolutions with Instance Normalization, LeakyReLU (alpha = 0.01), Dropout (0.3), and residual identity skip connections to prevent vanishing gradients.
-- **Additive Skip Connections & Localization Units:** Upsampled decoder features are summed with encoder representations and refined via 3x3 and 1x1 convolutions.
-- **Deep Supervision:** Auxiliary segmentation heads at multiple decoder scales are upsampled and summed into the final output to accelerate multi-scale gradient flow.
-- **Compound Loss:** Trained with a sum of multi-class Cross-Entropy and soft Sørensen-Dice loss (`L_total = L_CE + L_Dice`) to handle extreme foreground class imbalance (prostate < 2% of slice area).
+This project studies automated multi-organ pelvic segmentation and prostate anatomical contouring from MRI scans (`HipMRI` dataset) to investigate technical challenges in radiotherapy planning workflows. In this engineering study, dataset segmentation masks are treated as anatomical label benchmarks rather than clinically validated Clinical Target Volumes (CTV), and no clinical outcome claims (such as recurrence prevention or toxicity reduction) are made.
+
+This project implements a 2D adaptation inspired by the architecture of Isensee et al. (2018) and compares it with a 2D U-Net baseline based on Ronneberger et al. (2015). While Isensee et al. (2018) proposed a 3D network trained with multi-class Dice loss, our implementation adapts the core design to 2D axial slices with the following specifications:
+- **Residual Context Modules:** Two $3 \times 3$ convolutions with Instance Normalization, LeakyReLU ($\alpha = 0.01$), spatial Dropout ($0.3$), and residual identity skip connections using element-wise addition.
+- **Concatenation Skip Connections & Localization Units:** Encoder and upsampled decoder features are concatenated along the channel dimension (`torch.cat`), then refined via $3 \times 3$ and $1 \times 1$ convolutions.
+- **Deep Supervision:** Auxiliary segmentation heads at multiple decoder scales are upsampled and combined via element-wise addition into the final output logits.
+- **Compound Loss:** Training uses an equally weighted combination of class-weighted cross-entropy and soft Dice losses:
+  $$L = 0.5 L_{\mathrm{weighted\ CE}} + 0.5 L_{\mathrm{weighted\ Dice}}$$
+  with fixed class weights of $[0.2, 0.5, 1.0, 1.5, 2.0, 3.0]$ across the 6 classes to mitigate foreground class imbalance.
 
 ```text
-Input (1x256x256) -> [Conv 16] --------------------------------------> (+) -> [SegOut 1x]
-                         |                                              ^          |
-                  [Context 32] ------------------------> (+) -> [Loc] --/     [Upsample 2x]
-                         |                                ^      |                 |
-                  [Context 64] ----------> (+) -> [Loc] --/  [SegOut 2x] --------> (+) -> Softmax (6 Classes)
-                         |                  ^      |                               ^
-                  [Context 128] -> [Bottleneck]  [SegOut 4x] -> [Upsample 4x] -----/
+Input (1x256x256) -> [Conv 16] --------------------------------------> [Concat] -> [SegOut 1x]
+                         |                                                ^             |
+                  [Context 32] ------------------------> [Concat] -> [Loc]/       [Upsample 2x]
+                         |                                  ^         |                 |
+                  [Context 64] ----------> [Concat] -> [Loc]/    [SegOut 2x] --------> (+) -> Softmax (6 Classes)
+                         |                    ^         |                               ^
+                  [Context 128] -> [Bottleneck]    [SegOut 4x] -> [Upsample 4x] --------/
 ```
 
 ---
 
 ## 2. Data & Setup
-- **Dataset:** HipMRI Study (`/home/groups/comp3710/HipMRI_Study_open`)
-- **Leakage-Free Patient-Level Split:** The 38 patients are strictly separated by Patient ID prior to slice indexing:
-* Train: 30 patients (11,460 slices)
-* Validation: 4 patients (660 slices)
-* Held-Out Test: 4 patients (540 slices)
+
+- **Dataset Source:** Pre-sliced HipMRI study cohort provided via the COMP3710 course cluster (`/home/groups/comp3710/HipMRI_Study_open/keras_slices_data`), adapted using loading conventions from the COMP3710 Project Specification Appendix B.
+- **Data Partitioning & Patient Isolation Note:**
+  * The primary execution path in `dataset.py` loads pre-partitioned directories (`keras_slices_train`, `keras_slices_validate`, `keras_slices_test`), comprising 11,460 training slices, 660 validation slices, and 540 held-out test slices (reported as 30 / 4 / 4 patients in course documentation).
+  * *Code Audit Note:* When reading directly from these pre-split directories, `dataset.py` returns the file lists directly and does not execute programmatic patient-ID disjointness assertions. Programmatic set-disjoint assertions (`assert len(set(train) & set(test)) == 0`) and the 70%/15%/15% automatic patient split (which yields 26 / 5 / 7 patients across 38 cases) reside only in the fallback branch for unsplit directories. Verifying zero patient leakage on the pre-split directory path requires auditing extracted filename prefixes across the three folders to confirm $S_{\mathrm{train}} \cap S_{\mathrm{val}} = \emptyset$, $S_{\mathrm{train}} \cap S_{\mathrm{test}} = \emptyset$, and $S_{\mathrm{val}} \cap S_{\mathrm{test}} = \emptyset$.
 - **Preprocessing:** Per-slice Z-score normalization ($I' = \frac{I - \mu}{\sigma + 10^{-8}}$) and 6-class label mapping (0: Background, 1: Body, 2: Bone, 3: Bladder, 4: Rectum, 5: Prostate).
-- **Framework:** Python 3.11, torch==2.5.1+cu118, nibabel==5.2.1, numpy==1.26.4, matplotlib==3.9.2.
+- **Framework & Environment:** `torch==2.5.1+cu118`, `torchvision`, `nibabel==5.2.1`, `numpy==1.26.4`, `matplotlib==3.9.2` (developed with Python 3.11; Slurm job script configured with fallback `module load python/3.10`).
 
 ### Reproduction Commands
 ```bash
@@ -54,27 +57,26 @@ python predict.py --model improved \
 
 ---
 
-## 3. Feasibility Report (Compulsory Midpoint Review)
+## 3. Feasibility Report & Plan Evolution
 
 ### 3.1 User Need, Scope & Acceptance Criteria
-- **Intended User & Clinical Context:** Radiation oncologists and medical physicists performing external-beam radiotherapy dose planning. The tool serves as an interactive clinical contouring assistant that proposes prostate target volumes to reduce manual contouring time.
-- **Open Dilemma Addressed:** Resolving the *Spatial Context vs. Clinical Boundary Utility Dilemma*—diagnosing boundary leakage and slice-transition disconnections at the anatomical base (superior) and apex (inferior).
-- **Testable Acceptance Criteria:**
-  1. **Primary Segmentation Accuracy:** Achieve held-out test prostate DSC >= 0.75 for 2D slices (or >= 0.70 for 3D).
-  2. **Boundary & Overlap Utility:** Achieve test IoU >= 0.65 with dedicated error reporting on base and apex slices.
-  3. **Hardware & VRAM Constraints:** Peak training memory footprint <= 12.0 GB VRAM on UQ Rangpur compute nodes.
-  4. **Inference Latency:** Single-slice inference latency < 15 ms on a single GPU.
+- **Intended User & Context:** Radiation oncologists and medical physicists exploring automated pelvic organ contouring from MRI scans.
+- **Open Dilemma Addressed:** Investigating the *Spatial Context vs. Boundary Utility Dilemma*—evaluating how a 2D slice-wise segmentation architecture performs across large pelvic organs versus small cross-sectional prostate slices.
+- **Acceptance Criteria & Verification Outcome:**
+  1. **Primary Segmentation Accuracy (Not Met on Test Split):** Target held-out test prostate $\mathrm{DSC} \ge 0.75$ for 2D slices. The trained 2D Improved U-Net achieved a validation prostate DSC of **0.7955**, but a held-out test prostate DSC of **0.7432**, falling short of the preset test threshold by **0.0068**. Validation performance does not substitute for held-out test acceptance.
+  2. **Boundary & Overlap Metric:** Target test $\mathrm{IoU} \ge 0.65$ (originally $\ge 0.60$ in the standalone midpoint review); reported test prostate IoU is **0.6857** under batch-weighted evaluation.
+  3. **Hardware & VRAM Constraints:** Peak training memory footprint $\le 12.0\text{ GB}$ VRAM on UQ Rangpur nodes (achieved **2.66 GB**).
+  4. **Evaluation Throughput:** Average evaluation time $< 15\text{ ms / slice}$ on a single GPU (achieved **5.58 ms / slice** end-to-end evaluation time).
 
-### 3.2 Model Choice & Course Concepts
-- **Dataset & Hygiene:** UQ HipMRI study dataset (38 patients) partitioned strictly at the patient level to prevent inter-slice data leakage.
-- **Architecture & Fallback Execution:** Anchored on the **2D Improved U-Net** (Normal Difficulty, Isensee et al., 2018) with residual context units, deep supervision, and combined Dice-CE loss, benchmarked against a standard **2D U-Net** baseline.
+### 3.2 Scope Evolution from Standalone Midpoint Feasibility Report
+During the project midpoint review, the standalone `feasibility report.md` proposed an initial 3D volumetric target with a 2D fallback plan. Following our staged risk-mitigation strategy, we executed the 2D Improved U-Net fallback on `keras_slices_data`. The table below documents the exact changes between the initial standalone proposal and the final executed 2D setup:
 
-### 3.3 Preliminary Feasibility Evidence
-- **Data Audit:** 2D axial slices (256 x 256); prostate foreground occupies 1.2% - 1.8% of total pixels.
-- **Smoke Test (Local RTX 4060):** Verified forward/backward passes for Baseline 2D U-Net (7.76M params) and 2D Improved U-Net (3.19M params, 58.9% reduction).
-
-### 3.4 Technical Risks, Compute Budget & Fallback Plan
-- **Executed Fallback:** Following our planned risk mitigation strategy, we anchored the final full-scale 40-epoch HPC training and clinical error autopsy on the verified **2D Improved U-Net** pipeline on `keras_slices_data`, completing training in 44.6 minutes on a single NVIDIA A100 GPU.
+| Specification Item | Standalone Midpoint Feasibility Report | Final Executed Pipeline (README) | Reason for Adjustment |
+| :--- | :--- | :--- | :--- |
+| **Target Architecture** | 3D Improved U-Net (Hard) with 2D fallback | 2D Improved U-Net (Normal) vs. 2D U-Net Baseline | Executed planned 2D fallback to ensure a complete, verified pipeline within project schedule. |
+| **Prostate IoU Threshold** | $\ge 0.60$ | $\ge 0.65$ | Tightened overlap threshold when transitioning from 3D volume target to 2D slice evaluation. |
+| **Runtime Target** | $< 15\text{ seconds}$ per 3D patient volume | $< 15\text{ ms}$ per 2D axial slice | Adapted metric unit from volumetric scan latency to slice-wise evaluation throughput. |
+| **Partition Plan** | Approx. 26 / 6 / 6 (unsplit auto-partition) | 30 / 4 / 4 (pre-partitioned `keras_slices_data`) | Adopted the pre-partitioned directory structure provided on the course HPC storage. |
 
 ---
 
@@ -82,10 +84,15 @@ python predict.py --model improved \
 
 ### 4.1 Model Comparison & Resource Profile (Rangpur A100 GPU)
 
-| Model Architecture | Parameters | Peak GPU VRAM | Inference Latency | Best Val Prostate DSC | Test Prostate DSC | Test Prostate IoU |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Standard 2D U-Net (Baseline)** | 7.76 M | 3.82 GB | 8.42 ms / slice | 0.7180 | 0.6920 | 0.5840 |
-| **2D Improved U-Net (Ours)** | **3.19 M** | **2.66 GB** | **5.58 ms / slice** | **0.7955** | **0.7432** | **0.6857** |
+> **Measurement & Aggregation Protocol:**
+> 1. **Batch-Weighted Metric Aggregation:** In `evaluate()`, intersection and union counts are summed across all slices within each batch to compute a batch-level DSC and IoU, which are then averaged across batches weighted by batch slice count. This differs from patient-level volumetric aggregation, unweighted per-slice averaging, or global dataset-wide pixel summation. Because the nonlinear relation $\mathrm{IoU} = \frac{\mathrm{DSC}}{2 - \mathrm{DSC}}$ holds for a single confusion matrix (where $\mathrm{DSC}=0.7432$ corresponds to $\mathrm{IoU} \approx 0.5913$) but does not hold linearly after averaging across batches with varying foreground sizes, both metrics are reported directly as output by the batch-aggregated evaluation loop.
+> 2. **Channel Width Configuration:** `BaselineUNet2D` uses 32 base channels (7.76M parameters), whereas `ImprovedUNet2D` uses 16 base channels (3.19M parameters). Parameter, VRAM, and speed differences therefore reflect the combined effect of channel width and architectural modules rather than residual blocks or deep supervision alone.
+> 3. **Timing Definition:** The reported `ms / slice` values represent **average end-to-end evaluation pipeline time per slice** (including DataLoader fetching, host-to-device transfer, forward pass, and metric calculation without isolated CUDA synchronization warm-up), rather than pure forward-pass inference latency.
+
+| Model Architecture | Base Channels | Parameters | Peak GPU VRAM | Avg Eval Pipeline Time | Best Val Prostate DSC | Test Prostate DSC | Test Prostate IoU |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Standard 2D U-Net (Baseline)** | 32 | 7.76 M | 3.82 GB | 8.42 ms / slice | 0.7180 | 0.6920 | 0.5840 |
+| **2D Improved U-Net (Ours)** | 16 | **3.19 M** | **2.66 GB** | **5.58 ms / slice** | **0.7955** | **0.7432** | **0.6857** |
 
 ### 4.2 Per-Class Performance on Held-Out Test Split (540 Slices)
 
@@ -104,15 +111,15 @@ python predict.py --model improved \
 
 ## 5. Investigation of the Open Dilemma: Failure Case Autopsy
 
-While the 2D Improved U-Net achieves strong aggregate performance (Val Prostate DSC `0.7955`, Test DSC `0.7432`, Bladder DSC `0.9523`), sorting the 540 test slices by lowest prostate DSC reveals catastrophic local failures (`DSC = 0.0000`) exclusively at the **superior base** and **inferior apex** boundaries:
+To examine local failure modes behind the aggregate test prostate DSC (`0.7432`), we sorted the 540 held-out test slices by per-slice prostate DSC and inspected five lowest-scoring slices (`DSC = 0.0000`). Note that `Slice` numbers below denote **test DataLoader traversal indices** rather than verified anatomical $z$-coordinates, and a DSC of `0.0000` indicates zero true-positive overlap ($\mathrm{TP} = 0$), which can occur either from complete under-segmentation ($\mathrm{FN} > 0, \mathrm{FP} = 0$) or from non-overlapping false-positive predictions:
 
-| Case | Test Slice | Anatomical Region | Prostate DSC | Primary Failure Mode & Root Trigger |
+| Case | Test Loader Index | Visual Observation in Diagnostic Plot | Prostate DSC | Observed Error Pattern & Possible Contributing Factors |
 | :--- | :---: | :--- | :---: | :--- |
-| **#1** | `Slice 512` | Superior Base | `0.0000` | Complete False Negative (Yellow). Tiny prostate cross-section adjacent to the rectum is missed due to partial volume averaging. |
-| **#2** | `Slice 484` | Inferior Apex | `0.0000` | Complete False Negative. High-intensity bladder dominates feature activations; low-contrast apex tip is suppressed into background. |
-| **#3** | `Slice 250` | Inferior Apex | `0.0000` | Complete False Negative. Target area < 25 pixels lacks sufficient 2D texture cues to trigger positive classification. |
-| **#4** | `Slice 513` | Superior Base | `0.0000` | Adjacent to `Slice 512` (Case #1). Consecutive slice dropout proving lack of inter-slice (z-axis) continuity. |
-| **#5** | `Slice 188` | Inferior Apex | `0.0000` | Complete False Negative. Iso-intense border between prostate apex and pelvic floor musculature prevents 2D boundary separation. |
+| **#1** | `Slice 512` | Small ground-truth prostate mask adjacent to rectum | `0.0000` | Zero overlap ($\mathrm{TP}=0$, false negative in target region). Small target cross-section and low local contrast near the rectal boundary may hinder 2D feature discrimination. |
+| **#2** | `Slice 484` | Small ground-truth prostate mask near prominent bladder | `0.0000` | Zero overlap ($\mathrm{TP}=0$). High contrast of the adjacent bladder and faint prostate boundary may contribute to foreground miss. |
+| **#3** | `Slice 250` | Compact ground-truth target region | `0.0000` | Zero overlap ($\mathrm{TP}=0$). Limited 2D spatial extent provides sparse texture cues for positive classification. |
+| **#4** | `Slice 513` | Small ground-truth target region | `0.0000` | Zero overlap ($\mathrm{TP}=0$). Consecutive index in test traversal following `Slice 512`; verifying whether these represent adjacent anatomical slices requires mapping back to source NIfTI filenames. |
+| **#5** | `Slice 188` | Indistinct border between prostate mask and surrounding tissue | `0.0000` | Zero overlap ($\mathrm{TP}=0$). Low soft-tissue contrast along the target perimeter may prevent clear boundary separation. |
 
 ![Autopsy Case 1](predictions/autopsy_case_1_slice512_dice_0.000.png)
 ![Autopsy Case 2](predictions/autopsy_case_2_slice484_dice_0.000.png)
@@ -120,19 +127,29 @@ While the 2D Improved U-Net achieves strong aggregate performance (Val Prostate 
 ![Autopsy Case 4](predictions/autopsy_case_4_slice513_dice_0.000.png)
 ![Autopsy Case 5](predictions/autopsy_case_5_slice188_dice_0.000.png)
 
-### Root Cause Synthesis: Systematic Limitation vs. Isolated Noise
-These failures represent a **systematic structural limitation** of 2D slice-wise segmentation rather than isolated label noise. Because the 2D network processes slices independently without longitudinal (z-axis) context, it cannot propagate anatomical presence from adjacent slices (e.g., consecutive dropouts on Slices 512 and 513) when target cross-sections shrink below ~30 pixels at the base and apex.
+### Failure Mode Discussion & Hypotheses
+The model processes slices independently and therefore does not explicitly use through-plane context. This may contribute to segmentation errors where the target occupies a small cross-sectional area. However, the selected low-Dice examples alone do not establish the cause of failure or exclude annotation uncertainty. Confirming this explanation requires anatomical localisation of the cases (recording exact patient IDs, sequence IDs, ground-truth/predicted pixel counts, and TP/FP/FN breakdowns) and a controlled comparison with a model that incorporates neighbouring slices.
 
 ---
 
-## 6. Engineering Recommendation for Project Manager
-1. **Deploy for Mid-Gland & OAR Drafting:** The 2D Improved U-Net requires only `2.66 GB` VRAM and `5.58 ms/slice`, making it highly effective for auto-drafting large OARs (Bladder `0.9523`, Bone `0.9255`, Rectum `0.8513`) and central prostate slices.
-2. **Mandatory Human-in-the-Loop Triage Rule:** Do not use the 2D model autonomously at the superior/inferior margins. Implement an automated rule flagging any cranial/caudal transition slice where predicted prostate area drops below 50 mm^2 for mandatory manual contouring by a radiation oncologist.
-3. **When 3D Context is Justified:** Full 3D volumetric networks (or 2.5D multi-slice inputs) are strictly necessary if the clinical workflow requires automated apex/base boundary delineation.
+## 6. Engineering Recommendations for Future Validation
+
+1. **Evaluate Semi-Automated Drafting Potential in Follow-Up Studies:** While the 2D Improved U-Net shows promising test overlap on large pelvic structures (Bladder DSC `0.9523`, Pelvic Bone `0.9255`, Rectum `0.8513`) with modest memory usage (`2.66 GB` VRAM), it did not meet the preset $\ge 0.75$ test DSC criterion on the prostate class (`0.7432`). Further validation is required before considering clinical workflow integration.
+2. **Investigate Candidate Area Thresholds for Quality-Control Flagging:** Because zero-DSC failures frequently coincide with small ground-truth target cross-sections in our visual inspection, future work should evaluate a candidate pixel-area threshold on the validation split to flag uncertain slices for manual review. Converting any pixel-count rule into physical units (such as $\mathrm{mm}^2$) would first require preserving NIfTI voxel-spacing metadata in the data loader.
+3. **Conduct Controlled 2D vs. 2.5D/3D Ablation Studies:** Rather than assuming 3D networks are strictly necessary, a controlled experiment comparing matched-capacity 2D, 2.5D multi-slice, and 3D models under identical patient splits is recommended to test whether through-plane context reduces small-target dropouts.
 
 ---
 
 ## 7. Artificial Intelligence Usage Disclosure
+
 - **AI Tools Used:** OpenAI ChatGPT and Google Gemini.
-- **Assisted Tasks:** Scaffolding PyTorch residual blocks in `modules.py`, formatting matplotlib 4-panel discrepancy plots in `predict.py`, debugging Slurm GPU job parameters on Rangpur, and structuring markdown tables.
-- **Verification & Auditing:** All code was manually reviewed and tested. Patient-level split integrity in `dataset.py` was verified via programmatic set-disjoint assertions (`assert len(set(train) & set(test)) == 0`), and all reported metrics were obtained directly from full 40-epoch execution logs on the UQ Rangpur A100 cluster.
+- **Assisted Tasks:** Scaffolding PyTorch network modules in `modules.py`, data loader structure in `dataset.py`, training/evaluation loops in `train.py`, 4-panel matplotlib diagnostic plots in `predict.py`，reinforce `README.md` final report and declaration.
+- **Verification & Auditing Caveats:** Code scripts and markdown documentation were reviewed by the author. Note that while `dataset.py` includes a patient-level disjointness assertion in its automatic splitting branch, the primary execution path on Rangpur reads pre-partitioned directories (`keras_slices_train/validate/test`) without triggering that assertion.
+
+---
+
+## 8. References
+
+1. **Ronneberger, O., Fischer, P., & Brox, T. (2015).** U-Net: Convolutional Networks for Biomedical Image Segmentation. In *Medical Image Computing and Computer-Assisted Intervention – MICCAI 2015* (pp. 234–241). Springer International Publishing.
+2. **Isensee, F., Kickingereder, P., Wick, W., Bendszus, M., & Maier-Hein, K. H. (2018).** Brain Tumor Segmentation and Radiomics Survival Prediction: Contribution to the BRATS 2017 Challenge. In *Brainlesion: Glioma, Multiple Sclerosis, Stroke and Traumatic Brain Injuries* (pp. 287–297). Springer International Publishing.
+3. **COMP3710 Teaching Team (2026).** *COMP3710 Pattern Recognition Final Assessment Specification (Version 2.0), Appendix A (HipMRI Study Dataset) & Appendix B (Data Loading Reference).* School of Electrical Engineering and Computer Science, The University of Queensland.
